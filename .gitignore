@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# 对话存档
+conversation.json
+conversation.json.tmp
+# 长期记忆 SQLite 数据库
+memory.db
+*.db
