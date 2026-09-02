@@ -1,2 +1,2 @@
 # ainy
-AI女友
+AI智能陪伴Agent
