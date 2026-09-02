@@ -2,14 +2,14 @@ import atexit
 import json
 import logging
 import os
-import sqlite3
 import httpx
 
 from openai import OpenAI
 from dotenv import load_dotenv
 
 import sys_prompt_zh as sys_prompt
-import function_calls as function
+from memory import MemoryStore
+from mcp_client import McpToolRegistry
 
 load_dotenv(override=True)
 
@@ -34,63 +34,8 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MEMORY_PATH = os.path.join(_MODULE_DIR, "conversation.json")
 DEFAULT_DB_PATH = os.path.join(_MODULE_DIR, "memory.db")
 
-
-class MemoryStore:
-    """长期记忆的 SQLite 持久化：一条记录 = 一段长期记忆摘要。"""
-
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, max_rows: int = 60):
-        self.db_path = db_path
-        self.max_rows = max_rows
-        self.conn = sqlite3.connect(db_path)
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS memories (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-                content    TEXT NOT NULL
-            )
-            """
-        )
-        self.conn.commit()
-
-    def add(self, content: str) -> int:
-        """新增一条长期记忆，随后裁剪到上限。"""
-        cur = self.conn.execute(
-            "INSERT INTO memories(content) VALUES (?)", (content,)
-        )
-        self.conn.commit()
-        self._prune()
-        return cur.lastrowid
-
-    def add_if_missing(self, content: str) -> int:
-        """内容已存在则忽略（去重），否则新增。"""
-        row = self.conn.execute(
-            "SELECT id FROM memories WHERE content = ?", (content,)
-        ).fetchone()
-        if row:
-            return row[0]
-        return self.add(content)
-
-    def all(self) -> list:
-        """按时间顺序返回全部长期记忆内容。"""
-        rows = self.conn.execute(
-            "SELECT content FROM memories ORDER BY id"
-        ).fetchall()
-        return [r[0] for r in rows]
-
-    def count(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-
-    def _prune(self):
-        self.conn.execute(
-            "DELETE FROM memories WHERE id NOT IN "
-            "(SELECT id FROM memories ORDER BY id DESC LIMIT ?)",
-            (self.max_rows,),
-        )
-        self.conn.commit()
-
-    def close(self):
-        self.conn.close()
+# 长期记忆在上下文中出现的角色标记；加载旧对话时按此前缀识别并迁入 SQLite
+MEMORY_PREFIX = "[长期记忆] "
 
 
 class Sister:
@@ -102,6 +47,7 @@ class Sister:
         memory_path: str = DEFAULT_MEMORY_PATH,
         db_path: str = DEFAULT_DB_PATH,
         max_memories: int = 60,
+        recall_k: int = 3,
     ):
 
         self.model = os.getenv("AI_MYSISTER")
@@ -109,6 +55,7 @@ class Sister:
         self.max_tool_rounds = max_tool_rounds
         self.memory_path = memory_path
         self.db_path = db_path
+        self.recall_k = recall_k
 
         self.client = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
@@ -116,32 +63,26 @@ class Sister:
             http_client=httpx.Client(proxy=None)
         )
 
-        self.tools = function.tools
-
-        self.tool_call_map = {
-            "get_weather": function._get_weather,
-            "get_date": function._get_date,
-        }
+        # 工具全部来自 MCP Server：动态发现 schema，通过统一协议执行
+        self.registry = McpToolRegistry()
+        self.tools = self.registry.tools
+        if not self.tools:
+            logging.warning("没有任何可用 MCP 工具，将以纯对话模式运行")
 
         self.store = MemoryStore(db_path, max_rows=max_memories)
         atexit.register(self.store.close)
 
+        # self.messages 只放「系统提示词 + 对话历史」；
+        # 长期记忆按用户问题逐轮动态召回，不常驻在窗口里（见 memory_msgs）
         base = [{"role": "system", "content": sys_prompt.SISTER_PROMPT}]
-        long_term = self._memory_context()      # 长期记忆：来自 SQLite
-        short_term = self._load_history() or []  # 短期窗口：来自 conversation.json
-        self.messages = base + long_term + short_term
+        short_term = self._load_history() or []
+        self.messages = base + short_term
+        self.memory_msgs = []  # 当前这轮召回出来的长期记忆（system 消息）
 
     # ---------- 记忆 ----------
 
-    def _memory_context(self) -> list:
-        """把 SQLite 里的长期记忆组装成 system 消息（供模型当上下文）。"""
-        memories = self.store.all()
-        if not memories:
-            return []
-        return [{"role": "system", "content": f"[长期记忆] {m}"} for m in memories]
-
     def _load_history(self) -> list:
-        """从 conversation.json 恢复短期窗口；顺带把其中旧的 [长期记忆] 迁入 SQLite。"""
+        """从 conversation.json 恢复短期窗口；顺带把旧的 [长期记忆] 迁入 SQLite。"""
         try:
             with open(self.memory_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -156,9 +97,13 @@ class Sister:
 
         short = []
         for m in data:
-            if m.get("role") == "system" and str(m.get("content", "")).startswith("[长期记忆]"):
-                # 旧版的内联长期记忆 → 迁入 SQLite 并移出短期窗口
-                self.store.add_if_missing(m["content"])
+            content = str(m.get("content", ""))
+            if m.get("role") == "system" and content.startswith(MEMORY_PREFIX):
+                # 旧版本把长期记忆内联在对话里 → 迁入 SQLite 并移出短期窗口
+                self.store.add_if_missing(content[len(MEMORY_PREFIX):])
+            elif m.get("role") == "system" and content == sys_prompt.SISTER_PROMPT:
+                # 旧存档开头带一份系统提示词副本 → 丢弃，避免重复注入
+                continue
             else:
                 short.append(m)
 
@@ -193,38 +138,68 @@ class Sister:
             logging.warning(f"summarize failed: {e}")
             return None
 
+    @staticmethod
+    def _safe_boundary(history: list, min_keep: int = 6) -> int:
+        """找一个不会拆散「assistant 的 tool_call ↔ tool 结果」的折叠边界。
+
+        返回 history 前 i 条将被折叠成长期记忆；剩余 recent >= min_keep 条。
+        折叠边界若落在 assistant(tool_calls) 与其 tool 结果之间，会向模型
+        上下文注入「孤儿 tool 消息」，导致部分兼容端点报错。
+        """
+        if len(history) <= min_keep:
+            return max(1, len(history))
+        for i in range(len(history) - min_keep, 0, -1):  # 尽量多折叠
+            if history[i].get("role") != "tool":        # recent 首条不是 tool 即可
+                return i
+        return len(history) - min_keep
+
     def _condense_memory(self):
-        """窗口超限时：把最早一段对话压成长期记忆写入 SQLite，并保留最近几轮。"""
-        if len(self.messages) <= self.max_messages:
-            return
+        """窗口超限时：把最早一段对话压成长期记忆写入 SQLite，只保留最近几轮。
 
-        system = self.messages[:1]           # 始终保留系统提示词
-        keep_recent = 8
-        split = max(1, len(self.messages) - keep_recent)
-        old = self.messages[1:split]
-        recent = self.messages[split:]
+        长期记忆固化后不再留在对话窗口里（避免被重复摘要成新记忆），
+        之后按用户当前问题动态召回进上下文。
+        """
+        history = self.messages[1:]  # 不含系统提示词
+        while len(history) > self.max_messages:
+            boundary = self._safe_boundary(history)
+            old, recent = history[:boundary], history[boundary:]
 
-        summary = self._summarize(old)
-        if summary:
-            self.store.add(summary)          # 长期记忆持久化到 SQLite
-            memory_msg = {"role": "system", "content": f"[长期记忆] {summary.strip()}"}
-            self.messages = system + [memory_msg] + recent
-        else:
-            self.messages = system + recent
+            summary = self._summarize(old)
+            if summary:
+                self.store.add(summary.strip())  # 摘要 + 向量持久化到 SQLite
+                logging.info(f"已把 {boundary} 条旧消息固化为长期记忆")
+            else:
+                logging.warning("摘要失败，直接裁剪超限的历史消息")
+
+            self.messages = self.messages[:1] + recent
+            history = recent
+
+    def _recall_memory(self, query: str):
+        """按用户当前问题向量召回相关长期记忆，组装成 context 注入消息。"""
+        memories = self.store.recall(query, k=self.recall_k)
+        self.memory_msgs = [
+            {"role": "system", "content": f"{MEMORY_PREFIX}{m}"} for m in memories
+        ]
+        if memories:
+            logging.info(f"召回 {len(memories)} 条相关长期记忆")
 
     # ---------- 对话 ----------
+
+    def _context_messages(self) -> list:
+        """组装本次模型调用的完整上下文：系统提示词 + 召回记忆 + 对话历史。"""
+        return self.messages[:1] + self.memory_msgs + self.messages[1:]
 
     def _call_sister(self, with_tools: bool = True):
         """用 OpenAI SDK 流式调用 OpenAI 兼容的 /v1 端点。"""
         kwargs = {
             "model": self.model,
-            "messages": self.messages,
+            "messages": self._context_messages(),
             "stream": True,
             "extra_body": {
                 "thinking": "enable",
             }
         }
-        if with_tools:
+        if with_tools and self.tools:
             kwargs["tools"] = self.tools
         return self.client.chat.completions.create(**kwargs)
 
@@ -235,6 +210,7 @@ class Sister:
         has_print_tool = False
 
         tool_calls = {}
+        finish_reason = ""
 
         assistant_message = {
             "role": "assistant",
@@ -271,6 +247,8 @@ class Sister:
                 assistant_message["content"] += assistant_content
                 print(assistant_content, end="", flush=True)
 
+            # Streaming Tool Call：函数参数可能被拆在多个 chunk 里，
+            # 按 tool_call index 增量聚合，最后拼成完整 JSON 再解析
             if assistant_tool_calls:
                 if not has_print_tool:
                     print()
@@ -280,14 +258,19 @@ class Sister:
                     index = tc.index
                     if index not in tool_calls:
                         tool_calls[index] = {"id": "", "type": "function", "function": {"arguments": "", "name": ""}}
+                    # 流式首片可能只带 id 不带 function，逐字段判空增量拼接
                     if tc.id:
                         tool_calls[index]["id"] = tc.id
-                    if tc.function.name:
-                        tool_calls[index]["function"]["name"] = tc.function.name
-                    if tc.function.arguments:
-                        tool_calls[index]["function"]["arguments"] += tc.function.arguments
+                    if tc.function is not None:
+                        if tc.function.name:
+                            tool_calls[index]["function"]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_calls[index]["function"]["arguments"] += tc.function.arguments
 
-        assistant_message["tool_calls"] = list(tool_calls.values())
+        if tool_calls:
+            assistant_message["tool_calls"] = list(tool_calls.values())
+        else:
+            assistant_message.pop("tool_calls", None)  # 无工具调用时不带该字段
 
         self.messages.append(assistant_message)
 
@@ -302,9 +285,9 @@ class Sister:
         for tool in assistant_message["tool_calls"]:
             name = tool["function"]["name"]
             try:
-                tool_function = self.tool_call_map[name]
+                # 参数在流式传输中被拆散，这里才对聚合完成的 JSON 做解析
                 arg = json.loads(tool["function"]["arguments"] or "{}")
-                tool_result = str(tool_function(**arg))
+                tool_result = self.registry.call_tool(name, arg)  # 经 MCP 统一协议执行
             except Exception as e:
                 logging.warning(f"tool {name} failed: {e}")
                 tool_result = f"工具执行出错: {e}"
@@ -318,7 +301,10 @@ class Sister:
             "content": user_input
         })
 
+        # 上下文分层：超阈值则把最早的对话摘要固化为长期记忆
         self._condense_memory()
+        # 长期记忆按当前问题召回，只把相关的注入本轮的上下文
+        self._recall_memory(user_input)
 
         for _ in range(self.max_tool_rounds):
 
@@ -328,12 +314,14 @@ class Sister:
                 logging.error(f"call_sister failed : {e}")
                 raise
 
+            # Agent Loop：按 finish_reason 判断模型是否要调用工具
             assistant_message, finish_reason = self._parse_response(response)
 
             if finish_reason != "tool_calls":
                 self._save()
                 return assistant_message["content"]
 
+            # 执行工具并把结果重新注入上下文，让模型继续决策
             self._parse_tool_calls(assistant_message, finish_reason)
 
         # 达到工具调用轮次上限：强制一次不带工具的回答，避免无限循环且让会话自洽

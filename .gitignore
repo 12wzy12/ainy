@@ -222,3 +222,6 @@ conversation.json.tmp
 # 长期记忆 SQLite 数据库
 memory.db
 *.db
+
+# 个人文档（不提交）
+要求.txt
